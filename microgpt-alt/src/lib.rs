@@ -4,3 +4,4 @@
 //! delta adapters, and BPE tokenizer.
 
 pub mod config;
+pub mod data;
