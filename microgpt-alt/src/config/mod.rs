@@ -198,8 +198,17 @@ mod tests {
         assert!(cfg_high.validate().is_err());
     }
 
+    /// Lock so env tests don't run in parallel and pollute each other.
+    static CONFIG_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
     #[test]
     fn from_env_falls_back_to_defaults() {
+        let _g = CONFIG_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        std::env::remove_var(env_key(ENV_N_EMBED));
+        std::env::remove_var(env_key(ENV_SEED));
         let cfg = from_env().unwrap();
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.head_dim(), cfg.n_embed / cfg.n_head);
@@ -207,6 +216,10 @@ mod tests {
 
     #[test]
     fn from_env_overrides_with_env_vars() {
+        let _g = CONFIG_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         let key_n_embed = env_key(ENV_N_EMBED);
         let key_n_head = env_key(ENV_N_HEAD);
         std::env::set_var(&key_n_embed, "32");
@@ -220,6 +233,10 @@ mod tests {
 
     #[test]
     fn from_env_returns_error_on_invalid_parse() {
+        let _g = CONFIG_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         let key = env_key(ENV_SEED);
         std::env::set_var(&key, "not_a_number");
         let res = from_env();
@@ -261,6 +278,10 @@ mod tests {
 
     #[test]
     fn env_parsed_invalid_returns_parse_error() {
+        let _g = CONFIG_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         let key = env_key(ENV_N_EMBED);
         std::env::set_var(&key, "not_usize");
         let res = env_parsed::<usize>(&key);
