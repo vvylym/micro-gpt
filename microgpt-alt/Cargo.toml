@@ -1,0 +1,20 @@
+[package]
+name = "microgpt-alt"
+version = "0.1.0"
+authors = ["Guillaume M. <235853469+vvylym@users.noreply.github.com>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/vvylym/micro-gpt"
+homepage = "https://vvylym.github.io/micro-gpt/"
+publish = false
+
+[dependencies]
+rand = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[package.metadata.cargo-machete]
+ignored = ["rand"]
