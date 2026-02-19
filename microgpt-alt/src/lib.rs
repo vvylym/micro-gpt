@@ -1,0 +1,6 @@
+//! # microgpt-alt
+//!
+//! Refactored minimal GPT: config-driven, trait-based, with optional vector autograd,
+//! delta adapters, and BPE tokenizer.
+
+pub mod config;
