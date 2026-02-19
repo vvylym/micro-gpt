@@ -1,0 +1,5 @@
+# pmat quality-gate configuration (strict mode)
+# See: https://docs.rs/crate/pmat/
+
+[quality_gate]
+strict = true

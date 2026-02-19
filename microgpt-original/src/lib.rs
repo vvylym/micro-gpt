@@ -1,24 +1,17 @@
-//! # MicroGPT (Rust)
+//! # MicroGPT (Rust) — original implementation
 //!
-//! The most atomic way to train and inference a GPT in minimal Rust.
-//! This file is the complete algorithm; everything else is just efficiency.
-//!
-//! **Algorithmically aligned** with the Python reference. For a step-by-step guide, see:
-//! - [microgpt – Karpathy's blog](https://karpathy.github.io/2026/02/12/microgpt/)
-//! - [microgpt.py – GitHub Gist](https://gist.github.com/karpathy/8627fe009c40f57531cb18360106ce95)
-//!
-//! Code sections below mirror the article: Dataset → Tokenizer → Autograd → Parameters →
-//! Architecture (linear, softmax, rmsnorm, gpt) → Training loop → Inference.
+//! Minimal GPT: scalar autograd, transformer forward, training loop, and inference.
+//! Single crate containing the full algorithm.
 
 use rand::{prelude::*, rngs::StdRng};
-use rand_distr::{Distribution, Normal, weighted::WeightedIndex};
+use rand_distr::{weighted::WeightedIndex, Distribution, Normal};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 /// A fixed seed for reproducibility
 const SEED: u64 = 42;
-/// Input dataset path
-const INPUT_PATH: &str = "data/input.txt";
+/// Default input dataset path (overridable via env or run argument).
+pub const DEFAULT_INPUT_PATH: &str = "data/input.txt";
 //=======================================//
 //  Model parameters
 //=======================================//
@@ -29,7 +22,7 @@ const BLOCK_SIZE: usize = 16;
 const HEAD_DIM: usize = N_EMBED / N_HEAD;
 /// MLP hidden size = MLP_RATIO * N_EMBED (standard 4x in transformers)
 const MLP_RATIO: usize = 4;
-/// Weight init: Gaussian mean and std (aligns with Python `random.gauss(0, std)`)
+/// Weight init: Gaussian mean and std
 const INIT_MEAN: f64 = 0.0;
 const INIT_STD: f64 = 0.08;
 /// Epsilon for RMSNorm numerical stability
@@ -54,11 +47,7 @@ const TEMPERATURE: f64 = 0.5;
 const SAMPLE_SIZE: usize = 20;
 
 // =============================================================================
-// AUTOGRAD — chain rule through a computation graph (see article "Autograd")
-// =============================================================================
-// Each Value holds .data (forward) and .grad (dL/d(this)); backward() walks
-// the graph in reverse topological order and applies chain rule: child.grad +=
-// local_grad * self.grad. Same idea as PyTorch's loss.backward().
+// AUTOGRAD — chain rule through a computation graph
 // =============================================================================
 
 /// Handle to a scalar node in the autograd computation graph.
@@ -66,32 +55,20 @@ const SAMPLE_SIZE: usize = 20;
 /// Wraps [`Value`] in `Rc<RefCell<_>>` so that the graph can be shared and
 /// gradients can be accumulated during backward. Use [`ValueRef::data`] for the
 /// forward value and [`ValueRef::grad`] after [`ValueRef::backward`].
-///
-/// # Example
-///
-/// ```
-/// let a = ValueRef::new(2.0);
-/// let b = ValueRef::new(3.0);
-/// let c = a.add(&b);
-/// assert!((c.data() - 5.0).abs() < 1e-10);
-/// c.backward();
-/// assert!((a.grad() - 1.0).abs() < 1e-10);
-/// assert!((b.grad() - 1.0).abs() < 1e-10);
-/// ```
 #[derive(Clone)]
-struct ValueRef(Rc<RefCell<Value>>);
+pub(crate) struct ValueRef(Rc<RefCell<Value>>);
 
 /// Internal scalar node: forward value, gradient, and graph edges for backprop.
-struct Value {
-    data: f64, // scalar from forward pass
-    grad: f64, // d(loss)/d(this), filled in backward
+pub(crate) struct Value {
+    data: f64,
+    grad: f64,
     children: Vec<ValueRef>,
-    local_grads: Vec<f64>, // d(self)/d(child) for each child
+    local_grads: Vec<f64>,
 }
 
 impl ValueRef {
     /// Creates a leaf node (no children) with the given value and zero gradient.
-    fn new(data: f64) -> Self {
+    pub(crate) fn new(data: f64) -> Self {
         ValueRef(Rc::new(RefCell::new(Value {
             data,
             grad: 0.0,
@@ -111,33 +88,33 @@ impl ValueRef {
     }
 
     /// Forward pass value (scalar).
-    fn data(&self) -> f64 {
+    pub(crate) fn data(&self) -> f64 {
         self.0.borrow().data
     }
 
     /// Gradient of the loss with respect to this node; set by [`backward`](ValueRef::backward).
-    fn grad(&self) -> f64 {
+    pub(crate) fn grad(&self) -> f64 {
         self.0.borrow().grad
     }
 
-    /// Sets this node’s gradient (e.g. to 1.0 at the loss).
+    /// Sets this node's gradient (e.g. to 1.0 at the loss).
     fn set_grad(&self, g: f64) {
         self.0.borrow_mut().grad = g;
     }
 
-    /// Adds `g` to this node’s gradient (for accumulation when a value is used multiple times).
+    /// Adds `g` to this node's gradient (for accumulation when a value is used multiple times).
     fn add_grad(&self, g: f64) {
         self.0.borrow_mut().grad += g;
     }
 
     /// Addition: `self + other`. Local grads are 1 and 1.
-    fn add(&self, other: &ValueRef) -> ValueRef {
+    pub(crate) fn add(&self, other: &ValueRef) -> ValueRef {
         let data = self.data() + other.data();
         ValueRef::new_with_graph(data, vec![self.clone(), other.clone()], vec![1.0, 1.0])
     }
 
     /// Multiplication: `self * other`. Local grads are `other.data()` and `self.data()`.
-    fn mul(&self, other: &ValueRef) -> ValueRef {
+    pub(crate) fn mul(&self, other: &ValueRef) -> ValueRef {
         let data = self.data() * other.data();
         ValueRef::new_with_graph(
             data,
@@ -147,51 +124,51 @@ impl ValueRef {
     }
 
     /// Power: `self^exp`. Local grad is `exp * self^(exp-1)`.
-    fn pow(&self, exp: f64) -> ValueRef {
+    pub(crate) fn pow(&self, exp: f64) -> ValueRef {
         let data = self.data().powf(exp);
         let local_grad = exp * self.data().powf(exp - 1.0);
         ValueRef::new_with_graph(data, vec![self.clone()], vec![local_grad])
     }
 
     /// Natural log. Local grad is `1/self`.
-    fn log(&self) -> ValueRef {
+    pub(crate) fn log(&self) -> ValueRef {
         let data = self.data().ln();
         let local_grad = 1.0 / self.data();
         ValueRef::new_with_graph(data, vec![self.clone()], vec![local_grad])
     }
 
     /// Exponential. Local grad is `exp(self)`.
-    fn exp(&self) -> ValueRef {
+    pub(crate) fn exp(&self) -> ValueRef {
         let data = self.data().exp();
         let local_grad = data;
         ValueRef::new_with_graph(data, vec![self.clone()], vec![local_grad])
     }
 
     /// ReLU: `max(0, self)`. Local grad is 1 if `self > 0`, else 0.
-    fn relu(&self) -> ValueRef {
+    pub(crate) fn relu(&self) -> ValueRef {
         let data = self.data().max(0.0);
         let local_grad = if self.data() > 0.0 { 1.0 } else { 0.0 };
         ValueRef::new_with_graph(data, vec![self.clone()], vec![local_grad])
     }
 
     /// Negation: `-self`.
-    fn neg(&self) -> ValueRef {
+    pub(crate) fn neg(&self) -> ValueRef {
         let neg_one = ValueRef::new(-1.0);
         self.mul(&neg_one)
     }
 
     /// Subtraction: `self - other`.
-    fn sub(&self, other: &ValueRef) -> ValueRef {
+    pub(crate) fn sub(&self, other: &ValueRef) -> ValueRef {
         self.add(&other.neg())
     }
 
     /// Division: `self / other` (via `self * other^(-1)`).
-    fn div(&self, other: &ValueRef) -> ValueRef {
+    pub(crate) fn div(&self, other: &ValueRef) -> ValueRef {
         self.mul(&other.pow(-1.0))
     }
 
     /// Runs backprop: topological sort, then chain rule from this node (e.g. loss) to all leaves.
-    fn backward(&self) {
+    pub(crate) fn backward(&self) {
         let mut topo = Vec::new();
         let mut visited = std::collections::HashSet::new();
 
@@ -226,21 +203,18 @@ impl ValueRef {
         }
     }
 
-    /// Sets this node’s gradient to 0 (e.g. after an optimizer step).
-    fn zero_grad(&self) {
+    /// Sets this node's gradient to 0 (e.g. after an optimizer step).
+    pub(crate) fn zero_grad(&self) {
         self.set_grad(0.0);
     }
 }
 
-/// Model parameters: embeddings (wte, wpe), lm_head, and per-layer attention (wq, wk, wv, wo) and MLP (fc1, fc2).
-///
-/// All entries are [`ValueRef`] so gradients flow through training. Use [`StateDict::new`] to build with
-/// Gaussian init and [`StateDict::params`] to get a flat list for the optimizer.
-struct StateDict {
-    wte: Vec<Vec<ValueRef>>,          // token embedding
-    wpe: Vec<Vec<ValueRef>>,          // position embedding
-    lm_head: Vec<Vec<ValueRef>>,      // language model head
-    attn_wq: Vec<Vec<Vec<ValueRef>>>, // [layer][out][in]
+/// Model parameters: embeddings (wte, wpe), lm_head, and per-layer attention and MLP.
+pub(crate) struct StateDict {
+    wte: Vec<Vec<ValueRef>>,
+    wpe: Vec<Vec<ValueRef>>,
+    lm_head: Vec<Vec<ValueRef>>,
+    attn_wq: Vec<Vec<Vec<ValueRef>>>,
     attn_wk: Vec<Vec<Vec<ValueRef>>>,
     attn_wv: Vec<Vec<Vec<ValueRef>>>,
     attn_wo: Vec<Vec<Vec<ValueRef>>>,
@@ -250,7 +224,7 @@ struct StateDict {
 
 impl StateDict {
     /// Builds a new state dict with Gaussian(0, 0.08) weights for the given `vocab_size`.
-    fn new(vocab_size: usize, rng: &mut StdRng) -> Self {
+    pub(crate) fn new(vocab_size: usize, rng: &mut StdRng) -> Self {
         let normal = Normal::new(INIT_MEAN, INIT_STD).unwrap();
         let mut matrix = |nout: usize, nin: usize| -> Vec<Vec<ValueRef>> {
             (0..nout)
@@ -284,7 +258,7 @@ impl StateDict {
     }
 
     /// Returns all parameters as a flat list (for Adam or other optimizers).
-    fn params(&self) -> Vec<ValueRef> {
+    pub(crate) fn params(&self) -> Vec<ValueRef> {
         let mut params = Vec::new();
         for row in &self.wte {
             params.extend(row.clone());
@@ -329,13 +303,7 @@ impl StateDict {
     }
 }
 
-// =============================================================================
-// ARCHITECTURE — stateless function: token + position + KV cache → logits
-// (see article "Architecture"). GPT-2–like with RMSNorm, no biases, ReLU.
-// =============================================================================
-
-/// Matrix–vector multiply: one dot product per row of w. Building block of NNs.
-fn linear(x: &[ValueRef], w: &[Vec<ValueRef>]) -> Vec<ValueRef> {
+pub(crate) fn linear(x: &[ValueRef], w: &[Vec<ValueRef>]) -> Vec<ValueRef> {
     w.iter()
         .map(|wo| {
             let mut sum = ValueRef::new(0.0);
@@ -347,8 +315,7 @@ fn linear(x: &[ValueRef], w: &[Vec<ValueRef>]) -> Vec<ValueRef> {
         .collect()
 }
 
-/// Logits → probabilities in \[0,1] summing to 1. Subtract max for numerical stability.
-fn softmax(logits: &[ValueRef]) -> Vec<ValueRef> {
+pub(crate) fn softmax(logits: &[ValueRef]) -> Vec<ValueRef> {
     let max_val = logits
         .iter()
         .map(|v| v.data())
@@ -364,8 +331,7 @@ fn softmax(logits: &[ValueRef]) -> Vec<ValueRef> {
     exps.iter().map(|e| e.div(&total)).collect()
 }
 
-/// Root Mean Square Normalization: scale so activations have unit RMS; stabilizes training.
-fn rmsnorm(x: &[ValueRef]) -> Vec<ValueRef> {
+pub(crate) fn rmsnorm(x: &[ValueRef]) -> Vec<ValueRef> {
     let n = x.len() as f64;
     let mut ms = ValueRef::new(0.0);
     for xi in x {
@@ -377,26 +343,20 @@ fn rmsnorm(x: &[ValueRef]) -> Vec<ValueRef> {
     x.iter().map(|xi| xi.mul(&scale)).collect()
 }
 
-/// GPT forward: one token at position pos_id, with KV cache. Returns logits over next token.
-/// Embeddings → RMSNorm → for each layer: attention (Q,K,V, scale, softmax, V-sum, residual)
-/// → MLP (linear, ReLU, linear, residual) → lm_head → logits.
-fn micro_gpt(
+pub(crate) fn micro_gpt(
     token_id: usize,
     pos_id: usize,
     state: &StateDict,
     keys: &mut [Vec<Vec<ValueRef>>],
     values: &mut [Vec<Vec<ValueRef>>],
 ) -> Vec<ValueRef> {
-    // Embeddings: token + position (what the token is + where it is in the sequence)
     let mut x = Vec::new();
     for j in 0..N_EMBED {
         x.push(state.wte[token_id][j].add(&state.wpe[pos_id][j]));
     }
     x = rmsnorm(&x);
 
-    // Transformer layers: attention (communication) + MLP (computation)
     for li in 0..N_LAYER {
-        // 1) Multi-head attention: Q,K,V projections; cache K,V; scale dot-product; softmax; weighted sum of V; residual
         let x_residual = x.clone();
         x = rmsnorm(&x);
 
@@ -447,7 +407,6 @@ fn micro_gpt(
             .map(|(a, b)| a.add(b))
             .collect();
 
-        // 2) MLP block: linear up (4x), ReLU, linear down, residual
         let x_residual = x.clone();
         x = rmsnorm(&x);
         x = linear(&x, &state.mlp_fc1[li]);
@@ -463,20 +422,109 @@ fn micro_gpt(
     linear(&x, &state.lm_head)
 }
 
-// =============================================================================
-// MAIN: Dataset → Tokenizer → Model init → Training loop → Inference
-// =============================================================================
+/// Runs the full pipeline: load data, train, then inference.
+///
+/// Uses `input_path` for the dataset (one document per line). Prints progress and samples to stdout.
+pub fn run(input_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    run_impl(input_path, None)
+}
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Performs one training step: forward, backward, Adam update. Returns loss for logging.
+#[allow(clippy::too_many_arguments)]
+fn do_one_training_step(
+    doc: &str,
+    bos_token: usize,
+    char_to_id: &std::collections::HashMap<char, usize>,
+    state: &StateDict,
+    params: &[ValueRef],
+    m: &mut [f64],
+    v: &mut [f64],
+    step: usize,
+) -> f64 {
+    let mut tokens = vec![bos_token];
+    for ch in doc.chars() {
+        if let Some(&id) = char_to_id.get(&ch) {
+            tokens.push(id);
+        }
+    }
+    tokens.push(bos_token);
+    let n = (tokens.len() - 1).min(BLOCK_SIZE);
+
+    let mut keys = vec![Vec::new(); N_LAYER];
+    let mut values = vec![Vec::new(); N_LAYER];
+    let mut losses = Vec::new();
+    for pos_id in 0..n {
+        let token_id = tokens[pos_id];
+        let target_id = tokens[pos_id + 1];
+        let logits = micro_gpt(token_id, pos_id, state, &mut keys, &mut values);
+        let probs = softmax(&logits);
+        let loss_t = probs[target_id].log().neg();
+        losses.push(loss_t);
+    }
+    let mut loss = ValueRef::new(0.0);
+    for l in &losses {
+        loss = loss.add(l);
+    }
+    loss = loss.div(&ValueRef::new(n as f64));
+    loss.backward();
+
+    let lr_t = LEARNING_RATE * (1.0 - step as f64 / NUM_STEPS as f64);
+    for (i, p) in params.iter().enumerate() {
+        let grad = p.grad();
+        m[i] = BETA1 * m[i] + (1.0 - BETA1) * grad;
+        v[i] = BETA2 * v[i] + (1.0 - BETA2) * grad * grad;
+        let m_hat = m[i] / (1.0 - BETA1.powi(step as i32 + 1));
+        let v_hat = v[i] / (1.0 - BETA2.powi(step as i32 + 1));
+        let new_data = p.data() - lr_t * m_hat / (v_hat.sqrt() + EPSILON);
+        p.0.borrow_mut().data = new_data;
+        p.zero_grad();
+    }
+    loss.data()
+}
+
+/// Generates one inference sample (BOS -> sample until BOS or block size).
+fn do_one_inference_sample(
+    state: &StateDict,
+    vocab: &[char],
+    bos_token: usize,
+    rng: &mut StdRng,
+) -> String {
+    let mut keys = vec![Vec::new(); N_LAYER];
+    let mut values = vec![Vec::new(); N_LAYER];
+    let mut token_id = bos_token;
+    let mut sample_text = String::new();
+    for pos_id in 0..BLOCK_SIZE {
+        let logits = micro_gpt(token_id, pos_id, state, &mut keys, &mut values);
+        let scaled_logits: Vec<ValueRef> = logits
+            .iter()
+            .map(|l| l.div(&ValueRef::new(TEMPERATURE)))
+            .collect();
+        let probs = softmax(&scaled_logits);
+        let normalized: Vec<f64> = probs.iter().map(|p| p.data()).collect();
+        token_id = WeightedIndex::new(&normalized)
+            .ok()
+            .map(|dist| dist.sample(rng))
+            .unwrap_or(bos_token);
+        if token_id == bos_token {
+            break;
+        }
+        sample_text.push(vocab[token_id]);
+    }
+    sample_text
+}
+
+/// Internal implementation: when `max_steps` is `Some(n)`, training stops after n steps (for tests).
+#[doc(hidden)]
+pub(crate) fn run_impl(
+    input_path: &str,
+    max_steps: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = StdRng::seed_from_u64(SEED);
-
-    // ----- Dataset: documents (e.g. one name per line), shuffled -----
-    let input = std::fs::read_to_string(INPUT_PATH).expect("Failed to read input file");
+    let input = std::fs::read_to_string(input_path)?;
     let mut names: Vec<&str> = input.lines().filter(|l| !l.is_empty()).collect();
     names.shuffle(&mut rng);
     println!("num docs: {}", names.len());
 
-    // ----- Tokenizer: unique chars → token ids; BOS = vocab_size - 1 -----
     let unique_chars: std::collections::BTreeSet<char> =
         names.iter().flat_map(|n| n.chars()).collect();
     let vocab: Vec<char> = unique_chars.into_iter().collect();
@@ -484,112 +532,176 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vocab_size = vocab.len() + 1;
     println!("vocab size: {}", vocab_size);
 
-    // Create char-to-id map
     let char_to_id: std::collections::HashMap<char, usize> =
         vocab.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-
-    // ----- Parameters: state_dict (wte, wpe, lm_head, attn, mlp) with Gaussian init -----
     let state = StateDict::new(vocab_size, &mut rng);
     let params = state.params();
     println!("num params: {}", params.len());
 
-    // Adam optimizer buffers
     let mut m = vec![0.0; params.len()];
     let mut v = vec![0.0; params.len()];
+    let steps = max_steps.unwrap_or(NUM_STEPS);
 
-    // ----- Training loop: doc → [BOS, ...tokens..., BOS]; forward → loss; backward; Adam -----
-    for step in 0..NUM_STEPS {
-        // Tokenize one document with BOS on both sides (e.g. "emma" → [BOS, e, m, m, a, BOS])
+    for step in 0..steps {
         let doc = names[step % names.len()];
-        let mut tokens = vec![bos_token];
-        for ch in doc.chars() {
-            if let Some(&id) = char_to_id.get(&ch) {
-                tokens.push(id);
-            }
-        }
-        tokens.push(bos_token);
-
-        let n = (tokens.len() - 1).min(BLOCK_SIZE);
-
-        // Forward: for each position, logits → softmax → -log p(target); average loss
-        let mut keys = vec![Vec::new(); N_LAYER];
-        let mut values = vec![Vec::new(); N_LAYER];
-        let mut losses = Vec::new();
-
-        for pos_id in 0..n {
-            let token_id = tokens[pos_id];
-            let target_id = tokens[pos_id + 1];
-
-            let logits = micro_gpt(token_id, pos_id, &state, &mut keys, &mut values);
-            let probs = softmax(&logits);
-            let loss_t = probs[target_id].log().neg();
-            losses.push(loss_t);
-        }
-
-        let mut loss = ValueRef::new(0.0);
-        for l in &losses {
-            loss = loss.add(l);
-        }
-        loss = loss.div(&ValueRef::new(n as f64));
-
-        // Backward: backprop through graph; every param gets .grad
-        loss.backward();
-
-        // Adam: momentum m, second moment v, bias correction, then p.data -= lr * m_hat / (sqrt(v_hat) + eps)
-        let lr_t = LEARNING_RATE * (1.0 - step as f64 / NUM_STEPS as f64);
-        for (i, p) in params.iter().enumerate() {
-            let grad = p.grad();
-            m[i] = BETA1 * m[i] + (1.0 - BETA1) * grad;
-            v[i] = BETA2 * v[i] + (1.0 - BETA2) * grad * grad;
-
-            let m_hat = m[i] / (1.0 - BETA1.powi(step as i32 + 1));
-            let v_hat = v[i] / (1.0 - BETA2.powi(step as i32 + 1));
-
-            let new_data = p.data() - lr_t * m_hat / (v_hat.sqrt() + EPSILON);
-            p.0.borrow_mut().data = new_data;
-            p.zero_grad();
-        }
-
+        let loss_val = do_one_training_step(
+            doc,
+            bos_token,
+            &char_to_id,
+            &state,
+            &params,
+            &mut m,
+            &mut v,
+            step,
+        );
         if (step + 1) % LOSS_LOG_EVERY == 0 || step == 0 {
-            println!(
-                "step {:4} / {:4} | loss {:.4}",
-                step + 1,
-                NUM_STEPS,
-                loss.data()
+            println!("step {:4} / {:4} | loss {:.4}", step + 1, steps, loss_val);
+        }
+    }
+
+    let samples = if max_steps.is_some() { 2 } else { SAMPLE_SIZE };
+    println!("\n--- inference (new, hallucinated names) ---");
+    for sample_idx in 0..samples {
+        let sample_text = do_one_inference_sample(&state, &vocab, bos_token, &mut rng);
+        println!("sample {:2}: {}", sample_idx + 1, sample_text);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_ref_add_backward() {
+        let a = ValueRef::new(2.0);
+        let b = ValueRef::new(3.0);
+        let c = a.add(&b);
+        assert!((c.data() - 5.0).abs() < 1e-10);
+        c.backward();
+        assert!((a.grad() - 1.0).abs() < 1e-10);
+        assert!((b.grad() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn value_ref_mul_backward() {
+        let a = ValueRef::new(2.0);
+        let b = ValueRef::new(3.0);
+        let c = a.mul(&b);
+        assert!((c.data() - 6.0).abs() < 1e-10);
+        c.backward();
+        assert!((a.grad() - 3.0).abs() < 1e-10);
+        assert!((b.grad() - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn value_ref_chain_backward() {
+        let a = ValueRef::new(2.0);
+        let b = ValueRef::new(3.0);
+        let c = a.mul(&b).add(&ValueRef::new(1.0));
+        assert!((c.data() - 7.0).abs() < 1e-10);
+        c.backward();
+        assert!((a.grad() - 3.0).abs() < 1e-10);
+        assert!((b.grad() - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn value_ref_relu_backward() {
+        let a = ValueRef::new(-1.0);
+        let b = ValueRef::new(1.0);
+        let c = a.relu().add(&b.relu());
+        assert!((c.data() - 1.0).abs() < 1e-10);
+        c.backward();
+        assert!((a.grad() - 0.0).abs() < 1e-10);
+        assert!((b.grad() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn run_limited_steps_covers_training_and_inference() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("microgpt_run_limited_test.txt");
+        let mut f = std::fs::File::create(&path).expect("create temp file");
+        writeln!(f, "ab").expect("write");
+        writeln!(f, "cd").expect("write");
+        f.sync_all().expect("sync");
+        drop(f);
+        // Run with 2 steps and 2 samples to exercise training and inference without slowing tests
+        let result = run_impl(path.to_str().unwrap(), Some(2));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "run_impl(_, Some(2)) should succeed: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn run_succeeds_with_data_file() {
+        // Only run when data file exists (e.g. local or CI with data checked out)
+        if std::path::Path::new(DEFAULT_INPUT_PATH).exists() {
+            let result = run(DEFAULT_INPUT_PATH);
+            assert!(
+                result.is_ok(),
+                "run() should succeed with existing data file"
             );
         }
     }
 
-    // ----- Inference: start from BOS; sample next token from probs; repeat until BOS or max len -----
-    println!("\n--- inference (new, hallucinated names) ---");
-    for sample_idx in 0..SAMPLE_SIZE {
-        let mut keys = vec![Vec::new(); N_LAYER];
-        let mut values = vec![Vec::new(); N_LAYER];
-        let mut token_id = bos_token;
-        let mut sample_text = String::new();
-
-        for pos_id in 0..BLOCK_SIZE {
-            let logits = micro_gpt(token_id, pos_id, &state, &mut keys, &mut values);
-            // Temperature: divide logits by T before softmax (low T = sharper, high T = more random)
-            let scaled_logits: Vec<ValueRef> = logits
-                .iter()
-                .map(|l| l.div(&ValueRef::new(TEMPERATURE)))
-                .collect();
-            let probs = softmax(&scaled_logits);
-            let normalized: Vec<f64> = probs.iter().map(|p| p.data()).collect();
-
-            token_id = WeightedIndex::new(&normalized)
-                .ok()
-                .map(|dist| dist.sample(&mut rng))
-                .unwrap_or(bos_token);
-
-            if token_id == bos_token {
-                break;
-            }
-            sample_text.push(vocab[token_id]);
-        }
-        println!("sample {:2}: {}", sample_idx + 1, sample_text);
+    #[test]
+    fn linear_output_shape() {
+        let a = ValueRef::new(1.0);
+        let b = ValueRef::new(2.0);
+        let x = vec![a, b];
+        let w = vec![
+            vec![ValueRef::new(0.5), ValueRef::new(0.5)],
+            vec![ValueRef::new(1.0), ValueRef::new(0.0)],
+        ];
+        let out = linear(&x, &w);
+        assert_eq!(out.len(), 2);
+        assert!((out[0].data() - 1.5).abs() < 1e-10);
+        assert!((out[1].data() - 1.0).abs() < 1e-10);
     }
 
-    Ok(())
+    #[test]
+    fn softmax_sums_to_one() {
+        let logits = vec![ValueRef::new(0.0), ValueRef::new(0.0), ValueRef::new(0.0)];
+        let probs = softmax(&logits);
+        let sum: f64 = probs.iter().map(|p| p.data()).sum();
+        assert!((sum - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rmsnorm_preserves_direction() {
+        let x = vec![ValueRef::new(1.0), ValueRef::new(2.0)];
+        let out = rmsnorm(&x);
+        assert_eq!(out.len(), 2);
+        out[0].backward();
+    }
+
+    #[test]
+    fn state_dict_params_count() {
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let state = StateDict::new(10, &mut rng);
+        let params = state.params();
+        let expected = 10 * N_EMBED
+            + BLOCK_SIZE * N_EMBED
+            + 10 * N_EMBED
+            + N_LAYER
+                * (4 * N_EMBED * N_EMBED
+                    + (MLP_RATIO * N_EMBED) * N_EMBED
+                    + N_EMBED * (MLP_RATIO * N_EMBED));
+        assert_eq!(params.len(), expected);
+    }
+
+    #[test]
+    fn micro_gpt_forward_shape() {
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let vocab_size = 5;
+        let state = StateDict::new(vocab_size, &mut rng);
+        let mut keys = vec![Vec::new(); N_LAYER];
+        let mut values = vec![Vec::new(); N_LAYER];
+        let logits = micro_gpt(0, 0, &state, &mut keys, &mut values);
+        assert_eq!(logits.len(), vocab_size);
+    }
 }
