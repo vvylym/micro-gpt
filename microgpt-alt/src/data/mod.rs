@@ -1,15 +1,14 @@
 //! Input data loading (e.g. corpus lines from a file).
 //!
-//! Self-contained module with its own [`DataError`] type, [`DataItem`] and [`Data`] types, and a
-//! [`DataLoader`] trait so implementations can be sync now and async later (e.g. async `load` in a future trait).
+//! This module defines the **trait** ([`DataLoader`]), **models** ([`DataItem`], [`Data`]), and **error** ([`DataError`]).
+//! Implementations (e.g. [`PathLoader`] for file paths) are in the `impls` submodule. The trait allows sync load now and async later.
 
 mod error;
+mod impls;
 mod types;
 
-use std::fs;
-use std::path::Path;
-
 pub use error::DataError;
+pub use impls::{load_from_path, PathLoader};
 pub use types::{Data, DataItem};
 
 /// Trait for loading input data.
@@ -21,50 +20,13 @@ pub trait DataLoader {
     fn load(&self) -> Result<Data, DataError>;
 }
 
-/// Loads data from a file path (UTF-8, one line per [`DataItem`], trimmed; empty lines error).
-#[derive(Clone, Debug)]
-pub struct PathLoader<P>(pub P);
-
-impl<P> PathLoader<P>
-where
-    P: AsRef<Path>,
-{
-    /// Creates a loader for the given path.
-    #[must_use]
-    pub fn new(path: P) -> Self {
-        PathLoader(path)
-    }
-}
-
-impl<P> DataLoader for PathLoader<P>
-where
-    P: AsRef<Path>,
-{
-    fn load(&self) -> Result<Data, DataError> {
-        let content = fs::read_to_string(self.0.as_ref())?;
-        let items: Result<Vec<DataItem>, DataError> = content.lines().map(DataItem::new).collect();
-        let items = items?;
-        Data::new(items)
-    }
-}
-
-/// Convenience: load data from a path using [`PathLoader`].
-///
-/// # Errors
-///
-/// - [`DataError::Io`] when the path cannot be read or content is not valid UTF-8.
-/// - [`DataError::EmptyDataItem`] when a line is empty after trimming.
-/// - [`DataError::EmptyFile`] when the file yields no non-empty lines.
-pub fn load_from_path(path: impl AsRef<Path>) -> Result<Data, DataError> {
-    PathLoader::new(path).load()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::error::Error as _;
     use std::io::Write;
+    use std::path::Path;
 
     #[test]
     fn load_from_path_temp_file_returns_data() {
@@ -110,7 +72,6 @@ mod tests {
 
         let result = load_from_path(&path);
         let _ = std::fs::remove_file(&path);
-        // First line trims to empty → EmptyDataItem (we error on invalid line before checking "no data")
         assert!(matches!(result, Err(DataError::EmptyDataItem)));
     }
 
